@@ -1,5 +1,4 @@
-from flask import Flask, render_template_string, request, jsonify, send_file, after_this_request
-from werkzeug.utils import secure_filename
+from flask import Flask, render_template_string, request, jsonify, send_file
 import yt_dlp
 import threading
 import os
@@ -12,9 +11,6 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 progress = {"status": "idle", "percent": 0, "title": "", "filename": ""}
 download_lock = threading.Lock()
-
-def sanitize_filename(filename):
-    return re.sub(r'[^a-zA-Z0-9_\-\.]', '_', filename)
 
 def sizeof_fmt(num, suffix="B"):
     for unit in ["", "K", "M", "G", "T"]:
@@ -125,7 +121,7 @@ def index():
 def info():
     url = request.json.get("url")
     try:
-        ydl_opts = {"quiet": True, "nocheckcertificate": True, "cachedir": False}
+        ydl_opts = {"quiet": True, "nocheckcertificate": True, "cachedir": False, 'extractor_args': {'youtube': ['client=android']}}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         return jsonify({
@@ -156,23 +152,16 @@ def file(filename):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
     if not os.path.exists(file_path):
         return "File tidak ditemukan", 404
-
-    # ✅ Hapus file otomatis setelah dikirim ke user
-    @after_this_request
-    def remove_file(response):
-        try:
-            os.remove(file_path)
-            print(f"[INFO] File {filename} berhasil dihapus setelah diunduh.")
-        except Exception as e:
-            print(f"[WARNING] Gagal menghapus file {filename}: {e}")
-        return response
-
+        
+    # Hapus @after_this_request agar browser punya waktu untuk menyelesaikan unduhan.
+    # Pembersihan cache sudah di-handle oleh loop penghapus di awal download_audio().
     return send_file(file_path, as_attachment=True)
 
 def download_audio(url):
     global progress
     with download_lock:
-        # bersihin file lama biar gak bentrok
+        # SISTEM PEMBERSIHAN OTOMATIS: 
+        # Hapus sisa file lama di folder sebelum memulai download baru agar memori tidak bengkak.
         for f in os.listdir(DOWNLOAD_DIR):
             try:
                 os.remove(os.path.join(DOWNLOAD_DIR, f))
@@ -201,7 +190,8 @@ def download_audio(url):
 
         ydl_opts = {
             "format": "bestaudio/best",
-            "outtmpl": f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
+            "outtmpl": f"{DOWNLOAD_DIR}/ZIGFT_%(title)s.%(ext)s",
+            "restrictfilenames": True, # KUNCI: Memaksa yt-dlp menghapus emoji dan karakter aneh otomatis
             "progress_hooks": [hook],
             "noplaylist": True,
             "nocheckcertificate": True,
@@ -215,29 +205,23 @@ def download_audio(url):
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             }],
+            "extractor_args": {"youtube": ["client=android"]} # Penangkal HTTP 403
         }
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Unduh dan biarkan yt-dlp menentukan nama file akhirnya (karena postprocessor mengubahnya jadi mp3)
                 info = ydl.extract_info(url, download=True)
-                title = sanitize_filename(info.get("title", "audio"))
-                mp3_path = os.path.join(DOWNLOAD_DIR, f"{title}.mp3")
-                safe_name = secure_filename(f"{title}.mp3")
-
-                # pastikan file ditemukan
-                if not os.path.exists(mp3_path):
-                    for f in os.listdir(DOWNLOAD_DIR):
-                        if f.endswith(".mp3"):
-                            mp3_path = os.path.join(DOWNLOAD_DIR, f)
-                            safe_name = f
-                            break
-
-                os.rename(mp3_path, os.path.join(DOWNLOAD_DIR, safe_name))
+                filename = ydl.prepare_filename(info)
+                
+                # Mengambil nama file akurat setelah di-convert FFmpeg ke mp3
+                base, _ = os.path.splitext(filename)
+                safe_name = os.path.basename(base + ".mp3")
 
                 progress.update({
                     "filename": safe_name,
                     "status": "done",
-                    "title": f"✅ Selesai mengunduh: {title}"
+                    "title": f"✅ Selesai mengunduh: {info.get('title', 'Audio')}"
                 })
 
         except Exception as e:
